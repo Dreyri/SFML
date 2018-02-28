@@ -32,10 +32,14 @@
 #include <SFML/Graphics/VertexArray.hpp>
 #include <SFML/Graphics/VertexBuffer.hpp>
 #include <SFML/Graphics/GLCheck.hpp>
+#include <SFML/Window/Context.hpp>
+#include <SFML/System/Mutex.hpp>
+#include <SFML/System/Lock.hpp>
 #include <SFML/System/Err.hpp>
 #include <cassert>
 #include <iostream>
 #include <algorithm>
+#include <map>
 
 
 // GL_QUADS is unavailable on OpenGL ES, thus we need to define GL_QUADS ourselves
@@ -48,6 +52,14 @@
 
 namespace
 {
+    // Map to help us detect whether a different RenderTarget
+    // has been activated within a single context
+    typedef std::map<sf::Uint64, sf::RenderTarget*> ContextRenderTargetMap;
+    ContextRenderTargetMap contextRenderTargetMap;
+
+    // Mutex to protect our context-RenderTarget-map
+    sf::Mutex mutex;
+
     // Convert an sf::BlendMode::Factor constant to the corresponding OpenGL constant.
     sf::Uint32 factorToGlConstant(sf::BlendMode::Factor blendFactor)
     {
@@ -224,7 +236,22 @@ void RenderTarget::draw(const Vertex* vertices, std::size_t vertexCount,
         }
     #endif
 
-    if (setActive(true))
+    // Determine if the RenderTarget has been switched in this context
+    // If it hasn't, we can save rebinding/re-unbinding an FBO
+    Uint64 contextId = Context::getActiveContextId();
+
+    bool renderTargetSwitched = true;
+
+    {
+        sf::Lock lock(mutex);
+
+        ContextRenderTargetMap::iterator iter = contextRenderTargetMap.find(contextId);
+
+        if ((iter != contextRenderTargetMap.end()) && (iter->second == this))
+            renderTargetSwitched = false;
+    }
+
+    if (!renderTargetSwitched || setActive(true))
     {
         // Check if the vertex count is low enough so that we can pre-transform them
         bool useVertexCache = (vertexCount <= StatesCache::VertexCacheSize);
@@ -324,7 +351,22 @@ void RenderTarget::draw(const VertexBuffer& vertexBuffer, std::size_t firstVerte
         }
     #endif
 
-    if (setActive(true))
+    // Determine if the RenderTarget has been switched in this context
+    // If it hasn't, we can save rebinding/re-unbinding an FBO
+    Uint64 contextId = Context::getActiveContextId();
+
+    bool renderTargetSwitched = true;
+
+    {
+        sf::Lock lock(mutex);
+
+        ContextRenderTargetMap::iterator iter = contextRenderTargetMap.find(contextId);
+
+        if ((iter != contextRenderTargetMap.end()) && (iter->second == this))
+            renderTargetSwitched = false;
+    }
+
+    if (!renderTargetSwitched || setActive(true))
     {
         setupDraw(false, states);
 
@@ -572,8 +614,38 @@ void RenderTarget::applyShader(const Shader* shader)
 ////////////////////////////////////////////////////////////
 void RenderTarget::setupDraw(bool useVertexCache, const RenderStates& states)
 {
+    // Determine if the RenderTarget has been switched in this context
+    // If it has, we need to set up the necessary GL states again
+    // If no RenderTarget has been previously tracked in the current
+    // context, we reset states as well
+    // Currently, a very pessimistic approach is taken in which all states
+    // are reset
+    // The cost is amortized however, when ordering draws to the same
+    // RenderTarget into large contiguous batches
+    Uint64 contextId = Context::getActiveContextId();
+
+    bool renderTargetSwitched = false;
+
+    {
+        sf::Lock lock(mutex);
+
+        ContextRenderTargetMap::iterator iter = contextRenderTargetMap.find(contextId);
+
+        if (iter == contextRenderTargetMap.end())
+        {
+            renderTargetSwitched = true;
+            contextRenderTargetMap[contextId] = this;
+        }
+        else if (iter->second != this)
+        {
+            renderTargetSwitched = true;
+            iter->second = this;
+        }
+    }
+
     // First set the persistent OpenGL states if it's the very first call
-    if (!m_cache.glStatesSet)
+    // or if the RenderTarget has been switched within this context
+    if (!m_cache.glStatesSet || renderTargetSwitched)
         resetGLStates();
 
     if (useVertexCache)
@@ -596,9 +668,22 @@ void RenderTarget::setupDraw(bool useVertexCache, const RenderStates& states)
         applyBlendMode(states.blendMode);
 
     // Apply the texture
-    Uint64 textureId = states.texture ? states.texture->m_cacheId : 0;
-    if (textureId != m_cache.lastTextureId)
+    if (states.texture && states.texture->m_fboAttachment)
+    {
+        // If the texture is an FBO attachment, always rebind it
+        // in order to inform the OpenGL driver that we want changes
+        // made to it in other contexts to be visible here as well
+        // This saves us from having to call glFlush() in
+        // RenderTextureImplFBO which can be quite costly
+        // See: https://www.khronos.org/opengl/wiki/Memory_Model
         applyTexture(states.texture);
+    }
+    else
+    {
+        Uint64 textureId = states.texture ? states.texture->m_cacheId : 0;
+        if (textureId != m_cache.lastTextureId)
+            applyTexture(states.texture);
+    }
 
     // Apply the shader
     if (states.shader)
